@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#07020a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>粒子爱心 · 一朵花</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#07020a;overflow:hidden;
+    -webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;
+    touch-action:none;}
+  canvas{display:block;width:100%;height:100%;cursor:grab;}
+  canvas:active{cursor:grabbing;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  window.addEventListener('error', function (e) {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;left:0;top:0;right:0;padding:12px;background:#600;' +
+      'color:#fff;font:13px monospace;z-index:9;white-space:pre-wrap';
+    d.textContent = '❌ ' + (e.message || e.error) + ' @' + (e.lineno || '?');
+    document.body.appendChild(d);
+  });
+})();
+
+var CFG = {
+  heartPhone: 3500, heartDesk: 8500,
+  petalPhone: 2000, petalDesk: 4200,     // 花瓣
+  sepalPhone: 520,  sepalDesk: 1100,     // 花萼（背面）
+  stemPhone: 420,   stemDesk: 900,       // 花茎
+  leafPhone: 220,   leafDesk: 500,       // 叶子
+  petals: 22,
+  tilt: 0.24,
+  burstPeriod: 6.0,
+  burstSpeed: 0.50,
+  spring: 2.6,
+  damp: 0.905,
+  glowRatio: 0.18,
+  dragK: 0.0085,      // 左右拖动 → 旋转
+  dragKY: 0.0055,     // 上下拖动 → 俯仰
+  tiltMin: -0.45,
+  tiltMax: 1.35
+};
+
+var C_HEART = [
+  [255, 58, 118], [255, 96, 150], [255, 145, 188],
+  [255, 200, 224], [255, 248, 254]
+];
+var C_BLOOM = [
+  [185, 122, 22], [220, 158, 44], [248, 198, 90],
+  [255, 230, 158], [255, 250, 222]
+];
+// 花柄：调淡的薄荷绿（比之前浅很多）
+var C_GREEN = [
+  [130, 205, 168], [165, 222, 190], [198, 240, 215],
+  [228, 250, 238], [248, 255, 252]
+];
+
+/* ---------- 爱心隐函数 ---------- */
+function F(x, y, z) {
+  var a = x * x + 2.25 * y * y + z * z - 1.0;
+  return a * a * a - x * x * z * z * z - 0.1125 * y * y * z * z * z;
+}
+function halfThick(x, z) {
+  var y = 1.0;
+  while (y >= 0) {
+    if (F(x, y, z) <= 0) return y;
+    y -= 0.022;
+  }
+  return 0;
+}
+
+/* ---------- 花瓣曲面 ---------- */
+function petalPoint(t, phi, u, v) {
+  var tilt = 1.05 - 0.78 * t;
+  var ln = 0.16 + 0.62 * Math.pow(t, 0.8);
+  var baseR = 0.03 + 0.32 * t;
+  var baseY = 0.30 * Math.pow(1 - t, 1.40);
+  var spread = 0.42 + 0.50 * t;
+
+  var a = tilt - 0.35 * u * t;
+  var r = baseR + ln * u * Math.cos(a);
+  var y = baseY + ln * u * Math.sin(a);
+
+  var arc = spread * Math.sin(Math.PI * Math.pow(u, 0.75));
+  var ang = phi + v * arc;
+  y += 0.16 * (v * v) * (0.3 + 0.7 * u);
+  y -= 0.10 * t * (u * u);
+
+  return [r * Math.cos(ang), y, r * Math.sin(ang)];
+}
+
+var G = 2.399963229728653;
+
+/* ★ 一朵大花，斜放在爱心中央 */
+var FLOWER = { cx: 0.0, cy: 0.10, cz: 0.02, sc: 0.62, beta: 0.62, gamma: 0.42 };
+
+/* 花局部 → 世界 */
+var _cb = Math.cos(FLOWER.beta), _sb = Math.sin(FLOWER.beta);
+var _cg = Math.cos(FLOWER.gamma), _sg = Math.sin(FLOWER.gamma);
+function toWorld(lx, ly, lz, out) {
+  var x = lx * FLOWER.sc, y = ly * FLOWER.sc, z = lz * FLOWER.sc;
+  var y1 = y * _cb - z * _sb;
+  var z1 = y * _sb + z * _cb;
+  out[0] = FLOWER.cx + (x * _cg - y1 * _sg);
+  out[1] = FLOWER.cy + (x * _sg + y1 * _cg);
+  out[2] = FLOWER.cz + z1;
+  return out;
+}
+
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  var W, H, DPR, CX, CY, S;
+  var isPhone = /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent || '');
+
+  var HN = 0, hx, hy, hz, ox, oy, oz, vx, vy, vz, hc, hs, hg;
+  var BN = 0, bx, by, bz, bc, bs, bb, bph, bGreen;
+
+  var theta = 0, lastT = 0, burstTimer = 0;
+  var viewTilt = CFG.tilt;                 // ★ 俯仰角（上下滑控制）
+  var dragging = false, dragStartX = 0, dragStartY = 0;
+  var dragStartTheta = 0, dragStartTilt = 0, movedPx = 0, vel = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    CX = W / 2; CY = H / 2;
+    S = Math.min(W, H) / 2.85;
+    buildHeart();
+    buildFlower();
+  }
+
+  function buildHeart() {
+    HN = isPhone ? CFG.heartPhone : CFG.heartDesk;
+    hx = new Float32Array(HN); hy = new Float32Array(HN); hz = new Float32Array(HN);
+    ox = new Float32Array(HN); oy = new Float32Array(HN); oz = new Float32Array(HN);
+    vx = new Float32Array(HN); vy = new Float32Array(HN); vz = new Float32Array(HN);
+    hc = new Uint8Array(HN); hs = new Float32Array(HN); hg = new Uint8Array(HN);
+
+    var i = 0, tries = 0;
+    while (i < HN && tries < HN * 40) {
+      tries++;
+      var x = (Math.random() * 2 - 1) * 1.25;
+      var z = -1.45 + Math.random() * 2.55;
+      if (F(x, 0, z) > 0) continue;
+      var h = halfThick(x, z);
+      if (h <= 0) continue;
+      var y;
+      if (Math.random() < 0.85) {
+        y = h * (Math.random() < 0.5 ? 1 : -1) * (0.82 + 0.18 * Math.random());
+      } else {
+        y = (Math.random() * 2 - 1) * h;
+      }
+      hx[i] = x; hy[i] = y; hz[i] = z;
+      hc[i] = (Math.random() * 5) | 0;
+      hs[i] = 0.75 + Math.random() * 0.9;
+      hg[i] = Math.random() < CFG.glowRatio ? 1 : 0;
+      i++;
+    }
+    HN = i;
+  }
+
+  function buildFlower() {
+    var nPetal = isPhone ? CFG.petalPhone : CFG.petalDesk;
+    var nSepal = isPhone ? CFG.sepalPhone : CFG.sepalDesk;
+    var nStem = isPhone ? CFG.stemPhone : CFG.stemDesk;
+    var nLeaf = isPhone ? CFG.leafPhone : CFG.leafDesk;
+    BN = nPetal + nSepal + nStem + nLeaf * 2;
+
+    bx = new Float32Array(BN); by = new Float32Array(BN); bz = new Float32Array(BN);
+    bc = new Uint8Array(BN); bs = new Float32Array(BN); bb = new Float32Array(BN);
+    bph = new Float32Array(BN); bGreen = new Uint8Array(BN);
+
+    var out = [0, 0, 0];
+    var idx = 0;
+    var petals = CFG.petals;
+
+    /* ---- 1) 花瓣（正面） ---- */
+    for (var k = 0; k < nPetal; k++) {
+      var pid = k % petals;
+      var t = pid / (petals - 1);
+      var phi = pid * G;
+      var u = Math.pow(0.04 + 0.96 * Math.random(), 0.85);
+      var rv = Math.random();
+      var v = rv < 0.42 ? -1 : (rv < 0.84 ? 1 : 0);
+
+      var p = petalPoint(t, phi, u, v);
+      toWorld(p[0], p[1], p[2], out);
+      bx[idx] = out[0]; by[idx] = out[1]; bz[idx] = out[2];
+      bc[idx] = (Math.random() * 5) | 0;
+
+      // ★ 花瓣边缘（v=±1）加重；中间叶脉（v=0）单独压暗
+      var isEdge = (v !== 0);
+      bs[idx] = (0.9 + Math.random() * 0.9) * (isEdge ? 1.18 : 0.75);
+      bb[idx] = (0.72 + Math.random() * 0.28) * (isEdge ? 1.32 : 0.46);
+      if (isEdge && Math.random() < 0.45) bc[idx] = 3 + ((Math.random() * 2) | 0);  // 边缘偏白
+      bph[idx] = Math.random() * Math.PI * 2;
+      bGreen[idx] = 0;
+      idx++;
+    }
+
+    /* ---- 2) 花萼（背面，5 片绿色萼片） ---- */
+    var K5 = 5;
+    for (var s = 0; s < nSepal; s++) {
+      var j = s % K5;
+      var phij = j * 2 * Math.PI / K5 + 0.35;
+      var us = Math.pow(0.05 + 0.95 * Math.random(), 0.8);
+      var rr = 0.10 + 0.40 * us;
+      var yy = -0.04 - 0.36 * Math.pow(us, 1.6);       // 往后弯
+      var halfang = 0.22 * (1 - 0.78 * us);
+      var rvs = Math.random();
+      var vv = rvs < 0.45 ? -1 : (rvs < 0.90 ? 1 : 0);
+      var angs = phij + vv * halfang;
+
+      toWorld(rr * Math.cos(angs), yy, rr * Math.sin(angs), out);
+      bx[idx] = out[0]; by[idx] = out[1]; bz[idx] = out[2];
+      bc[idx] = (Math.random() * 5) | 0;
+      bs[idx] = 0.8 + Math.random() * 0.8;
+      bb[idx] = 0.45 + Math.random() * 0.30;
+      bph[idx] = Math.random() * Math.PI * 2;
+      bGreen[idx] = 1;
+      idx++;
+    }
+
+    /* ---- 3) 花茎 ---- */
+    toWorld(0.0, -0.05, 0.0, out);
+    var baseX = out[0], baseY = out[1], baseZ = out[2];
+    var topZ = baseZ - 0.02, botZ = -0.98;
+
+    for (var m = 0; m < nStem; m++) {
+      var uz = Math.random();
+      var zz = topZ + (botZ - topZ) * uz;
+      var wander = 0.045 * Math.sin(uz * 3.0);
+      bx[idx] = baseX * (1 - uz) + wander + (Math.random() - 0.5) * 0.012;
+      by[idx] = baseY * (1 - uz) + 0.02 * Math.sin(uz * 5.0) + (Math.random() - 0.5) * 0.012;
+      bz[idx] = zz;
+      bc[idx] = (Math.random() * 5) | 0;
+      bs[idx] = 0.75 + Math.random() * 0.7;
+      bb[idx] = 0.42 + Math.random() * 0.28;
+      bph[idx] = Math.random() * Math.PI * 2;
+      bGreen[idx] = 1;
+      idx++;
+    }
+
+    /* ---- 4) 两片叶子 ---- */
+    var leafDef = [[0.42, 0.34, 1], [0.60, 0.30, -1]];
+    for (var lf = 0; lf < 2; lf++) {
+      var zuf = leafDef[lf][0], lean = leafDef[lf][1], side = leafDef[lf][2];
+      var z0 = topZ + (botZ - topZ) * zuf;
+      for (var n2 = 0; n2 < nLeaf; n2++) {
+        var sl = Math.random();
+        var w = 0.075 * Math.sin(Math.PI * Math.pow(sl, 0.75));
+        var sgn = Math.random() < 0.5 ? -1 : 1;
+        bx[idx] = baseX * (1 - zuf) + side * lean * sl;
+        by[idx] = baseY * (1 - zuf) + sgn * w;
+        bz[idx] = z0 + lean * sl * 0.70;
+        bc[idx] = (Math.random() * 5) | 0;
+        bs[idx] = 0.75 + Math.random() * 0.7;
+        bb[idx] = 0.38 + Math.random() * 0.26;
+        bph[idx] = Math.random() * Math.PI * 2;
+        bGreen[idx] = 1;
+        idx++;
+      }
+    }
+
+    BN = idx;
+  }
+
+  function burst(strength) {
+    for (var i = 0; i < HN; i++) {
+      var nx = hx[i], ny = hy[i], nz = hz[i];
+      var L = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      var sp = strength * (0.6 + Math.random() * 0.8);
+      vx[i] += nx / L * sp;
+      vy[i] += ny / L * sp;
+      vz[i] += nz / L * sp;
+    }
+  }
+
+  function frame(now) {
+    if (!lastT) lastT = now;
+    var dt = Math.min((now - lastT) / 1000, 0.05);
+    lastT = now;
+
+    if (!dragging) {
+      theta += vel * dt;
+      vel *= 0.94;
+      if (Math.abs(vel) < 0.002) vel = 0;
+    }
+
+    burstTimer += dt;
+    if (burstTimer > CFG.burstPeriod) { burstTimer = 0; burst(CFG.burstSpeed); }
+
+    var ct = Math.cos(theta), st = Math.sin(theta);
+    var cp = Math.cos(viewTilt), sp = Math.sin(viewTilt);
+    var tt = now / 1000;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#07020a';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    var k = CFG.spring, dampC = (1 - CFG.damp) * 7;
+
+    /* ===== 花 + 花萼 + 茎叶 ===== */
+    for (var j = 0; j < BN; j++) {
+      var swy = Math.sin(tt * 1.2 + bph[j]) * 0.004;
+      var x = bx[j], y = by[j], z = bz[j] + swy;
+
+      var rx = x * ct - y * st;
+      var ry = x * st + y * ct;
+      var ry2 = ry * cp - z * sp;
+      var rz2 = ry * sp + z * cp;
+
+      var px = CX + rx * S;
+      var py = CY - rz2 * S;
+      if (px < -20 || px > W + 20 || py < -20 || py > H + 20) continue;
+
+      var d = (ry2 + 0.8) / 1.6;
+      if (d < 0) d = 0; else if (d > 1) d = 1;
+
+      var c = bGreen[j] ? C_GREEN[bc[j]] : C_BLOOM[bc[j]];
+      // ★ 花瓣：远处也不要衰减太狠（下限 0.50）；茎叶保持原来的衰减
+      var depthK = bGreen[j] ? (0.32 + 0.68 * d) : (0.50 + 0.50 * d);
+      var a = bb[j] * depthK;
+      var s = bs[j] * (0.8 + 1.2 * d);
+
+      ctx.globalAlpha = a * 0.12;
+      ctx.fillStyle = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+      if (!bGreen[j]) {
+        ctx.fillRect(px - s * 1.5, py - s * 1.5, s * 3.0, s * 3.0);
+      }
+
+      ctx.globalAlpha = a * 0.85;
+      ctx.fillRect(px - s / 2, py - s / 2, s, s);
+    }
+
+    /* ===== 爱心 ===== */
+    for (var i = 0; i < HN; i++) {
+      vx[i] += (-k * ox[i] - dampC * vx[i]) * dt;
+      vy[i] += (-k * oy[i] - dampC * vy[i]) * dt;
+      vz[i] += (-k * oz[i] - dampC * vz[i]) * dt;
+      ox[i] += vx[i] * dt;
+      oy[i] += vy[i] * dt;
+      oz[i] += vz[i] * dt;
+
+      var X = hx[i] + ox[i], Y = hy[i] + oy[i], Z = hz[i] + oz[i];
+      var RX = X * ct - Y * st;
+      var RY = X * st + Y * ct;
+      var RY2 = RY * cp - Z * sp;
+      var RZ2 = RY * sp + Z * cp;
+
+      var PX = CX + RX * S;
+      var PY = CY - RZ2 * S;
+
+      var D = (RY2 + 0.8) / 1.6;
+      if (D < 0) D = 0; else if (D > 1) D = 1;
+
+      var cc = C_HEART[hc[i]];
+      var aa = 0.14 + 0.70 * D;
+      var ss = hs[i] * (0.7 + 1.3 * D);
+
+      if (hg[i]) {
+        ctx.globalAlpha = aa * 0.15;
+        ctx.fillStyle = 'rgb(' + cc[0] + ',' + cc[1] + ',' + cc[2] + ')';
+        ctx.fillRect(PX - ss * 1.6, PY - ss * 1.6, ss * 3.2, ss * 3.2);
+      }
+
+      ctx.globalAlpha = aa;
+      ctx.fillStyle = 'rgb(' + cc[0] + ',' + cc[1] + ',' + cc[2] + ')';
+      ctx.fillRect(PX - ss / 2, PY - ss / 2, ss, ss);
+    }
+
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    requestAnimationFrame(frame);
+  }
+
+  function getX(e) {
+    if (e.touches && e.touches.length) return e.touches[0].clientX;
+    if (e.changedTouches && e.changedTouches.length) return e.changedTouches[0].clientX;
+    return e.clientX || 0;
+  }
+  function getY(e) {
+    if (e.touches && e.touches.length) return e.touches[0].clientY;
+    if (e.changedTouches && e.changedTouches.length) return e.changedTouches[0].clientY;
+    return e.clientY || 0;
+  }
+
+  function onDown(e) {
+    dragging = true;
+    dragStartX = getX(e); dragStartY = getY(e);
+    dragStartTheta = theta; dragStartTilt = viewTilt;
+    movedPx = 0; vel = 0;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var dx = getX(e) - dragStartX;
+    var dy = getY(e) - dragStartY;
+    if (Math.abs(dx) > 3) movedPx = Math.max(movedPx, Math.abs(dx));
+    if (Math.abs(dy) > 3) movedPx = Math.max(movedPx, Math.abs(dy));
+
+    // 左右 → 绕竖直轴旋转（已反向）
+    theta = dragStartTheta - dx * CFG.dragK;
+
+    // ★ 上下 → 俯仰角（已反向：往上拖 = 从上方看）
+    viewTilt = dragStartTilt - dy * CFG.dragKY;
+    if (viewTilt < CFG.tiltMin) viewTilt = CFG.tiltMin;
+    if (viewTilt > CFG.tiltMax) viewTilt = CFG.tiltMax;
+
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    vel = (theta - dragStartTheta) * 2.2;
+    if (vel > 6) vel = 6; else if (vel < -6) vel = -6;
+    if (movedPx < 8) { burst(CFG.burstSpeed * 1.4); burstTimer = 0; }
+  }
+
+  window.addEventListener('pointerdown', onDown, { passive: false });
+  window.addEventListener('pointermove', onMove, { passive: false });
+  window.addEventListener('pointerup', onUp, { passive: false });
+  window.addEventListener('pointercancel', onUp, { passive: false });
+  window.addEventListener('resize', function () {
+    clearTimeout(window.__rz); window.__rz = setTimeout(resize, 200);
+  });
+  window.addEventListener('orientationchange', function () { setTimeout(resize, 280); });
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
